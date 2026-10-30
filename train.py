@@ -1,3 +1,6 @@
+from argparse import ArgumentParser
+import math
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -12,33 +15,63 @@ def batch_end_callback(trainer):
     if trainer.iter_num % 100 == 0:
         print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
 
-def eval_split(trainer, model, split, dataset, max_batches):
-    n = len(dataset)
-    results = []
-    loader = DataLoader(dataset, batch_size=trainer.config.batch_size, num_workers=0, drop_last=False)
+def generate_samples(trainer, model, dataset, prompts, max_new_tokens=50):
+    tokenizer = dataset.tokenizer.encoder
+    context_window = model.block_size - max_new_tokens
+
+    print("\n=== Sample generations ===")
+    for prompt in prompts:
+        prompt_ids = tokenizer.encode(prompt)[-context_window:]
+        x = torch.tensor(prompt_ids, dtype=torch.long, device=trainer.device)[None, ...]
+        generated = model.generate(x, max_new_tokens, do_sample=True, top_k=40)
+        text = tokenizer.decode(generated[0].tolist())
+        print(f"\nPrompt: {prompt!r}\n{text}")
+
+
+def eval_loss(trainer, model, split, dataset, max_batches=5):
+    loader = DataLoader(dataset, batch_size=trainer.config.batch_size, num_workers=0)
+    losses = []
+
     for b, (x, y) in enumerate(loader):
         if b >= max_batches:
             break
         x = x.to(trainer.device)
         y = y.to(trainer.device)
-        inp = x[:, :n]
-        sol = y[:, -n:]
+        _, loss = model(x, y)
+        losses.append(loss.item())
 
-        cat = model.generate(inp, n, do_sample=False)
-        sol_candidate = cat[:, n:]
+    mean_loss = sum(losses) / len(losses)
+    perplexity = math.exp(mean_loss)
+    print(f"{split} loss: {mean_loss:.4f}; perplexity: {perplexity:.2f}")
 
-        correct = (sol == sol_candidate).all(1).cpu()
-        for i in range(x.size(0)):
-            results.append(int(correct[i]))
-            print("GPT claims that %s sorted is %s but gt is %s" % (inp[i].tolist(), sol_candidate[i].tolist(), sol[i].tolist()))
 
-    rt = torch.tensor(results, dtype=torch.float)
-    print("%s final score: %d/%d = %.2f%% correct" % (split, rt.sum(), len(results), 100*rt.mean()))
-    return rt.sum()
+def eval_generation(trainer, model, split, dataset, max_batches=5, max_new_tokens=32):
+    loader = DataLoader(dataset, batch_size=trainer.config.batch_size, num_workers=0)
+    prompt_length = dataset.get_block_size() // 2
+    results = []
+
+    for b, (x, _) in enumerate(loader):
+        if b >= max_batches:
+            break
+        x = x.to(trainer.device)
+        prompt = x[:, :prompt_length]
+        target = x[:, prompt_length:prompt_length + max_new_tokens]
+        generated = model.generate(prompt, target.size(1), do_sample=False)
+        prediction = generated[:, prompt_length:]
+        results.extend(prediction.eq(target).all(dim=1).cpu().tolist())
+
+    accuracy = sum(results) / len(results)
+    print(f"{split} generation: {sum(results)}/{len(results)} = {100 * accuracy:.2f}% correct")
 
 def train():
-    train_dataset = JSONLDataset(file_path='test_data.jsonl', split='train', test_size=10, block_size=128)
-    test_dataset = JSONLDataset(file_path='test_data.jsonl', split='test', test_size=10, block_size=128)
+    parser = ArgumentParser()
+    parser.add_argument('--file_path', type=str, default='test_data.jsonl', help='Path to the JSONL dataset file')
+    parser.add_argument('--test_size', type=int, default=20, help='Number of samples to use for testing')
+    parser.add_argument('--block_size', type=int, default=128, help='Block size for the model')
+    args = parser.parse_args()
+
+    train_dataset = JSONLDataset(file_path='test_data.jsonl', split='train', test_size=args.test_size, block_size=args.block_size)
+    test_dataset = JSONLDataset(file_path='test_data.jsonl', split='test', test_size=args.test_size, block_size=args.block_size)
 
     model_config = GPT.get_default_config()
     model_config.model_type = 'gpt-nano'
@@ -48,7 +81,7 @@ def train():
 
     train_config = Trainer.get_default_config()
     train_config.learning_rate = 5e-4
-    train_config.max_iters = 101
+    train_config.max_iters = 10_001
     train_config.num_workers = 0
     train_config.batch_size = 1
     trainer = Trainer(train_config, model, train_dataset)
@@ -58,14 +91,21 @@ def train():
     model.eval()
 
     with torch.no_grad():
-        eval_split(trainer, model, 'train', train_dataset, max_batches=5)
-        eval_split(trainer, model, 'test', test_dataset, max_batches=5)
-
-    breakpoint()
-    
-
-
-    
+        eval_loss(trainer, model, 'train', train_dataset)
+        eval_loss(trainer, model, 'test', test_dataset)
+        eval_generation(trainer, model, 'train', train_dataset)
+        eval_generation(trainer, model, 'test', test_dataset)
+        generate_samples(
+            trainer,
+            model,
+            train_dataset,
+            prompts=[
+                "The",
+                "Once upon a time",
+                "In the future",
+                "The most important thing",
+            ],
+        )
 
 if __name__ == "__main__":
     train()
